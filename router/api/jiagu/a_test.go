@@ -11,8 +11,8 @@ import (
 )
 
 func TestC(t *testing.T) {
-	resp, err := grequests.Get("https://www.python.org/ftp/python/pc/32python.zip", nil)
-	if err != nil {
+	resp, err := grequests.Get("https://www.python.org/ftp/python/pc/32python.zip",nil)
+	if err !=nil {
 		fmt.Println(err.Error())
 	}
 	if err != nil {
@@ -23,15 +23,16 @@ func TestC(t *testing.T) {
 	uid := uuid.New()
 	randomPath := fmt.Sprintf("/normal/%s%s", uid, path.Ext(fileSourceName))
 	defer resp.Close()
-	os.MkdirAll("/normal", 0766)
+	os.MkdirAll("/normal",0766)
 	err = resp.DownloadToFile(randomPath)
-	if err != nil {
+	if err !=nil {
 		fmt.Println(err)
 	}
 	f, _ := os.Open(randomPath)
 	go func() {
 		_ = os.Remove(randomPath)
 	}()
+
 
 	fmt.Println(f)
 }

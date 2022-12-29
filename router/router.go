@@ -35,7 +35,9 @@ func Init(r *gin.Engine) {
 	//android.Use(middleware.Translations())
 	{
 		android.POST("/bin_check_apk", ceping.BinCheckApk)
+		android.POST("/search_one_progress", ceping.SearchOneProgress)
 		android.GET("/apk_report", ceping.ApkReport)
+		android.POST("/batch_statistics_result", ceping.BatchStatisticsResult)
 		android.POST("/search_one_detail", ceping.SearchOneDetail)
 		android.POST("/get_all", ceping.GetAllInfo)                // 获取测评列表
 		android.POST("/batch_file_delete", ceping.BatchFileDelete) // 删除测评任务

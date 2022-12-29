@@ -11,11 +11,12 @@ import (
 	"testing"
 )
 
-func Test(t *testing.T) {
+func Test(t *testing.T){
 
 }
 
-func aaa(r *gin.Context) {
+
+func aaa(r *gin.Context){
 	token := r.GetHeader("token")
 	url := ip + "/dmcwebapi/api/dmc/ReqToken"
 	contentType := "application/json"

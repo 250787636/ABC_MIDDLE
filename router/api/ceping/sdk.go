@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -83,36 +84,124 @@ type SdkBinCheckRequest struct {
 // SdkBinCheck 14.1.上传sdk并发送检测接口
 func SdkBinCheck(c *gin.Context) {
 
-	var request = SdkBinCheckRequest{}
-	valid, errs := app.BindAndValid(c, &request)
+	var FormReq = SdkBinCheckRequest{}
+	valid, errs := app.BindAndValid(c, &FormReq)
 	if !valid {
 		log.Error("err:", errs.Error())
 		response.FailWithMessage(errs.Error(), c)
 		return
 	}
 	var templateInfo model.Template
-	if request.TemplateId == 0 {
+	if FormReq.TemplateId == 0 {
 		templateInfo.Items = GetAllItems("sdk")
 	} else {
-		templateInfo.ID = uint(request.TemplateId)
+		templateInfo.ID = uint(FormReq.TemplateId)
 		if err := app.DB.Model(&model.Template{}).First(&templateInfo).Error; err != nil {
 			log.Error("err:", err)
 			response.FailWithMessage("未查询到当前模板", c)
 			return
 		}
 	}
-	var sdkResponse struct {
-		utils.ResponseJson
-		SecInfos string `json:"sec_infos"`
-		ItemKnum int    `json:"item_knum"`
-		TaskId   int    `json:"task_id"`
+
+	//fmt.Println("找出来的测评项", templateInfo.Items)
+	// 1.1.读取文件
+	open, err := os.Open(FormReq.FilePath)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
 	}
-	sdkClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	sdkClient.Token = app.Conf.CePing.Token
-	sdkClient.Signature = app.Conf.CePing.Signature
-	err := sdkClient.BinCheckApkClient(&sdkResponse, templateInfo.Items, request.CallBackUrl, map[string]string{
-		"sdk": request.FilePath,
-	})
+
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	part, err := writer.CreateFormFile("sdk", path.Base(open.Name()))
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	_, err = io.Copy(part, open)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	var itemArr []string
+	err = jsoniter.UnmarshalFromString(templateInfo.Items, &itemArr)
+	if err != nil {
+		log.Error(err)
+	}
+
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["items"] = itemArr
+	paramMap["callback_url"] = FormReq.CallBackUrl
+	paramMap["sdk_name"] = FormReq.SdkName
+	paramMap["sdk_version"] = FormReq.SdkVersion
+	paramMap["sdk_tag"] = FormReq.SdkTag
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	clientURL := IP + "/v4/sdk/bin_check"
+	// 发送一个POST请求
+	req, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	// 设置你需要的Header（不要想当然的手动设置Content-Type）multipart/form-data
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// 执行请求
+	resp, err := Client.Do(req)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage("调用测评平台上传sdk接口失败", c)
+		return
+	}
+
+	// 3.读取返回内容
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage("读取测评平台上传sdk内容失败", c)
+		return
+	}
+	//fmt.Println("psot", string(post))
+
+	var sdkResponse struct {
+		Msg    string `json:"msg"`
+		State  int    `json:"state"`
+		TaskId int    `json:"task_id"`
+	}
+
+	err = jsoniter.Unmarshal(post, &sdkResponse)
+	if err != nil {
+		log.Error("调用测评上传sdk解析内容失败", err)
+		response.FailWithMessage("调用测评平台接口解析内容失败,err:"+err.Error(), c)
+		return
+	}
 
 	if sdkResponse.State != 200 {
 		if sdkResponse.Msg == "签名验证失败" || sdkResponse.Msg == "token验证失败" {
@@ -133,18 +222,21 @@ func SdkBinCheck(c *gin.Context) {
 		response.FailWithMessage("调用测评平台上传sdk接口失败"+sdkResponse.Msg, c)
 		return
 	}
-	//sdkclient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	//sdkclient.Token = app.Conf.CePing.Token
-	//sdkclient.Signature = app.Conf.CePing.Signature
+	sdkclient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
+	sdkclient.Token = app.Conf.CePing.Token
+	sdkclient.Signature = app.Conf.CePing.Signature
 	var sdkUrl struct {
 		utils.ResponseJson
 		SdKUrl   string `json:"sdk_url"`
 		ItemKnum int    `json:"item_knum"`
 	}
 
-	if err = sdkClient.SdkSearchOneDetail(&sdkUrl, sdkResponse.TaskId); err != nil {
+	if err = sdkclient.SdkSearchOneDetail(&sdkUrl, sdkResponse.TaskId); err != nil {
 		log.Error(err)
 	}
+	//if err = sdkUrl.Unmarshal(&sdkUrl); err != nil {
+	//	log.Error(err)
+	//}
 
 	userId, _ := c.Get("userId")
 	userID := userId.(uint)
@@ -152,13 +244,13 @@ func SdkBinCheck(c *gin.Context) {
 	info := model.CePingUserTask{}
 	info.TaskType = 4
 	info.TaskID = strconv.Itoa(sdkResponse.TaskId)
-	info.PkgName = path.Base(request.FilePath)
-	info.AppName = request.SdkName
-	info.TemplateID = uint(request.TemplateId)
-	info.Version = request.SdkVersion
+	info.PkgName = path.Base(open.Name())
+	info.AppName = FormReq.SdkName
+	info.TemplateID = uint(FormReq.TemplateId)
+	info.Version = FormReq.SdkVersion
 	info.Status = "测评中"
 	info.UserID = userID
-	info.FilePath = request.FilePath
+	info.FilePath = FormReq.FilePath
 	info.ViewUrl = sdkUrl.SdKUrl
 	info.ItemsNum = sdkUrl.ItemKnum
 
@@ -166,7 +258,7 @@ func SdkBinCheck(c *gin.Context) {
 
 	sdkUse := model.SdkUse{}
 	sdkUse.TaskID = info.TaskID
-	sdkUse.TaskTag = request.SdkTag
+	sdkUse.TaskTag = FormReq.SdkTag
 	app.DB.Model(&model.SdkUse{}).Create(&sdkUse)
 
 	SdkHandler.Add(sdkResponse.TaskId)
@@ -331,6 +423,10 @@ func GetSdkInfo(taskId int, hand *SdkHandle) {
 
 		return
 	}
+	//if infoNum.Msg != "" {
+	//	fmt.Println("获取sdk任务失败,错误为:", infoNum.Msg)
+	//	return
+	//}
 
 	var info model.CePingUserTask
 	//info.PkgName = infoNum.Data.AppInfo.PkgName
@@ -360,31 +456,69 @@ func SdkSearchOneDetail(c *gin.Context) {
 		return
 	}
 
-	var responses struct {
-		utils.ResponseJson
-		DownUrl    string   `json:"down_url"`
-		Id         int      `json:"id"`
-		IsDeleted  bool     `json:"is_deleted"`
-		ItemKeys   []string `json:"item_keys"`
-		ItemKnum   int      `json:"item_knum"`
-		ItemNum    int      `json:"item_num"`
-		ResCode    int      `json:"res_code"`
-		SdkMd5     string   `json:"sdk_md5"`
-		SdkName    string   `json:"sdk_name"`
-		SdkSize    int      `json:"sdk_size"`
-		SdkVersion string   `json:"sdk_version"`
-		TCommit    string   `json:"t_commit"`
-		TUpdate    string   `json:"t_update"`
-		UserId     int      `json:"user_id"`
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = req.TaskId
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
 	}
 
-	sdkClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	sdkClient.Token = app.Conf.CePing.Token
-	sdkClient.Signature = app.Conf.CePing.Signature
-	if err := sdkClient.SearchOneDetailClient(&responses, req.TaskId); err != nil {
-		log.Error(err)
+	clientURL := IP + "/v4/sdk/search_one_detail"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
 	}
-	response.OkWithData(responses, c)
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	//Do方法发送请求
+	resp, err := client.Do(request)
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+
+	reponse := make(map[string]interface{})
+	err = jsoniter.Unmarshal(post, &reponse)
+	if err != nil {
+		log.Error(err)
+
+		return
+	}
+	err = Check(reponse, post, SdkSearchOneDetail, c)
+	if err != nil {
+		log.Error(err.Error())
+		return
+	}
+
+	response.OkWithData(reponse, c)
 }
 
 type SdkBatchStatisticsResultRequest struct {

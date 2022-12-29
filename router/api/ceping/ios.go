@@ -5,7 +5,6 @@ import (
 	"example.com/m/model"
 	"example.com/m/pkg/app"
 	"example.com/m/pkg/log"
-	"example.com/m/utils"
 	"example.com/m/utils/response"
 	"fmt"
 	"github.com/gin-gonic/gin"
@@ -14,6 +13,8 @@ import (
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
+	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,7 +71,7 @@ func (h *IosHandle) Check(hand *IosHandle) {
 }
 
 type IosBinCheckRequest struct {
-	CallbackUrl string `form:"callback_url"`
+	CallBackUrl string `form:"callback_url"`
 	TaskType    string `form:"task_type"`
 	AppName     string `form:"app_name"`
 	TemplateId  int    `form:"template_id"`
@@ -80,37 +81,114 @@ type IosBinCheckRequest struct {
 // IosBinCheck 3.1.上传ipa并发送检测接口
 func IosBinCheck(c *gin.Context) {
 
-	var request = IosBinCheckRequest{}
-	valid, errs := app.BindAndValid(c, &request)
+	var FormReq = IosBinCheckRequest{}
+	valid, errs := app.BindAndValid(c, &FormReq)
 	if !valid {
 		log.Error("err:", errs.Error())
 		response.FailWithMessage(errs.Error(), c)
 		return
 	}
 	var templateInfo model.Template
-	if request.TemplateId == 0 {
+	if FormReq.TemplateId == 0 {
 		templateInfo.Items = GetAllItems("ios")
 	} else {
-		templateInfo.ID = uint(request.TemplateId)
+		templateInfo.ID = uint(FormReq.TemplateId)
 		if err := app.DB.Model(&model.Template{}).First(&templateInfo).Error; err != nil {
 			log.Error("err:", err)
 			response.FailWithMessage("未查询到当前模板", c)
 			return
 		}
 	}
-	// 1.解析内容
-	var iosResponse struct {
-		utils.ResponseJson
-		SecInfos string `json:"sec_infos"`
-		ItemKnum int    `json:"item_knum"`
-		TaskId   int    `json:"task_id"`
+	//fmt.Println("找出来的测评项", templateInfo.Items)
+	// 1.1.读取文件
+	open, err := os.Open(FormReq.FilePath)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
 	}
-	adClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	adClient.Token = app.Conf.CePing.Token
-	adClient.Signature = app.Conf.CePing.Signature
-	err := adClient.BinCheckApkClient(&iosResponse, templateInfo.Items, request.CallbackUrl, map[string]string{
-		"ipa": request.FilePath,
-	})
+
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	part, err := writer.CreateFormFile("ipa", path.Base(open.Name()))
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	_, err = io.Copy(part, open)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["items"] = templateInfo.Items
+	paramMap["callback_url"] = FormReq.CallBackUrl
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	clientURL := IP + "/v4/ios/bin_check"
+	// 发送一个POST请求
+	req, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	// 设置你需要的Header（不要想当然的手动设置Content-Type）multipart/form-data
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// 执行请求
+	resp, err := Client.Do(req)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage("调用测评平台上传ios接口失败", c)
+		return
+	}
+
+	// 3.读取返回内容
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Error("err:", err)
+		response.FailWithMessage("读取测评平台上传ios内容失败", c)
+		return
+	}
+	//fmt.Println("psot", string(post))
+
+	var iosResponse struct {
+		Msg    string `json:"msg"`
+		State  int    `json:"state"`
+		TaskId int    `json:"task_id"`
+	}
+
+	err = jsoniter.Unmarshal(post, &iosResponse)
+	if err != nil {
+		log.Error("调用测评上传ios解析内容失败", err)
+		response.FailWithMessage("调用测评平台接口解析内容失败,err:"+err.Error(), c)
+		return
+	}
 
 	if iosResponse.State != 200 {
 		if iosResponse.Msg == "签名验证失败" || iosResponse.Msg == "token验证失败" {
@@ -137,11 +215,11 @@ func IosBinCheck(c *gin.Context) {
 	info := model.CePingUserTask{}
 	info.TaskType = 2
 	info.TaskID = strconv.Itoa(iosResponse.TaskId)
-	info.AppName = request.AppName
-	info.TemplateID = uint(request.TemplateId)
+	info.AppName = FormReq.AppName
+	info.TemplateID = uint(FormReq.TemplateId)
 	info.Status = "测评中"
 	info.UserID = userID
-	info.FilePath = request.FilePath
+	info.FilePath = FormReq.FilePath
 
 	app.DB.Model(&model.CePingUserTask{}).Create(&info)
 
@@ -152,24 +230,59 @@ func IosBinCheck(c *gin.Context) {
 
 // CheckIpaInfo 获取当前正在检测ipa任务的信息
 func CheckIpaInfo(taskId int, hand *IosHandle) {
-	var responses struct {
-		utils.ResponseJson
-		FinishItem int    `json:"finish_item"`
-		QueueNumer int    `json:"queue_numer"`
-		Status     string `json:"status"`
-		TotalItem  int    `json:"total_item"`
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = taskId
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		return
 	}
-	iosClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	iosClient.Token = app.Conf.CePing.Token
-	iosClient.Signature = app.Conf.CePing.Signature
-	if err := iosClient.TaskProgress(&responses, "iOS", taskId); err != nil {
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		return
+	}
+
+	clientURL := IP + "/v4/ios/search_one_detail"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		return
+	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	//Do方法发送请求
+	resp, err := client.Do(request)
+	if err != nil {
+		return
+	}
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	reponse := make(map[string]interface{})
+	err = jsoniter.Unmarshal(post, &reponse)
+	if err != nil {
 		log.Error(err)
+		return
 	}
 
 	errMessage := ""
-
-	if responses.State != 200 {
-		errMessage = responses.Msg
+	if len(reponse) == 0 {
+		errMessage = strings.Trim(string(post), `"`)
+	} else if key, ok := reponse["state"].(float64); ok && key != 200 {
+		errMessage = reponse["msg"].(string)
 	}
 	fmt.Println("err", errMessage)
 	if errMessage == "签名验证失败" || errMessage == "token验证失败" {
@@ -188,52 +301,130 @@ func CheckIpaInfo(taskId int, hand *IosHandle) {
 		log.Error("err", errMessage)
 		return
 	}
-	var taskInfo model.CePingUserTask
-	taskInfo.Status = "测评中"
-	taskInfo.ItemsNum = responses.TotalItem
-	taskInfo.FinishItem = responses.FinishItem
 
-	switch responses.Status {
-	case "EXCEPTION":
-		hand.RemoveTask(taskId)
-		taskInfo.Status = "测评失败"
-		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).Updates(&taskInfo).Error; err != nil {
+	score := reponse["app_score"].(float64)
+
+	fmt.Println("app", reponse["item_knum"])
+	itemKnum := reponse["item_knum"].(float64)
+	fmt.Println("down_url", reponse["view_url"])
+	viewUrl, _ := reponse["view_url"].(string)
+	num := reponse["item_num"].(float64)
+
+	var getInfo model.CePingUserTask
+	getInfo.ViewUrl = viewUrl
+	getInfo.ItemsNum = int(itemKnum)
+	getInfo.Score = int(score)
+	getInfo.FinishItem = int(num)
+	if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).Updates(&getInfo).Error; err != nil {
+		if err != nil {
 			log.Error(err)
+			return
+		}
+	}
+
+	var FindInfo model.CePingUserTask
+	if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).First(&FindInfo).Error; err != nil {
+		if err != nil {
+			log.Error(err)
+
+			return
+		}
+	}
+	if FindInfo.CreatedAt.Add(1*time.Hour).Unix() < time.Now().Unix() {
+		hand.RemoveTask(int(taskId))
+		FindInfo.Status = "测评失败"
+
+		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).Updates(&FindInfo).Error; err != nil {
+			log.Error(err)
+
+			return
 		}
 		return
-	case "REPORT_GENERATING":
+	}
+
+	pkgName := reponse["app_name"].(string)
+	version := reponse["app_version"].(string)
+	//fmt.Println("app", reponse)
+	knum := reponse["item_knum"].(float64)
+	if knum-num == 1 {
+		var taskInfo model.CePingUserTask
 		taskInfo.Status = "测评报告生成中"
 		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).
 			Updates(&taskInfo).Error; err != nil {
 			fmt.Println("修改失败", err)
 			log.Error(err)
+
 			return
 		}
-	case "FINISHED":
-		taskInfo.Status = "测评完成"
-		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).
-			Updates(&taskInfo).Error; err != nil {
-			log.Error(err.Error())
-			return
-		}
+	}
+
+	if knum == num {
 		// 如果检测完毕 就获取检测信息
-		GetIpaInfo(taskId)
-		hand.RemoveTask(taskId)
-	default:
-		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).
-			Updates(&taskInfo).Error; err != nil {
-			log.Error(err.Error())
-			return
-		}
+		GetIpaInfo(taskId, hand)
+		//IosHandler.RemoveTask(int(taskId))
+		hand.RemoveTask(int(taskId))
+		return
+	}
+
+	var taskInfo model.CePingUserTask
+	taskInfo.PkgName = pkgName
+	taskInfo.Version = version
+	if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).Updates(&taskInfo); err != nil {
+		fmt.Println(err)
+		log.Error(err)
+		return
 	}
 
 }
 
 // GetIpaInfo 获取ipa检测信息
-func GetIpaInfo(taskId int) {
+func GetIpaInfo(taskId int, hand *IosHandle) {
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = taskId
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		return
+	}
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		return
+	}
+
+	clientURL := IP + "/v4/ios/preview"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		log.Error(err)
+
+		return
+	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	//Do方法发送请求
+	resp, err := client.Do(request)
+	defer resp.Body.Close()
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+
 	times := time.Now()
+
 	var infoNum struct {
-		utils.ResponseJson
 		Data struct {
 			AppInfo struct {
 				PkgName string `json:"app_name"`
@@ -244,19 +435,27 @@ func GetIpaInfo(taskId int) {
 				High   int `json:"high"`
 			} `json:"risk_statistic"`
 		} `json:"data"`
-	}
-	iosClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	iosClient.Token = app.Conf.CePing.Token
-	iosClient.Signature = app.Conf.CePing.Signature
-	if err := iosClient.GetIpaInfoClient(&infoNum, taskId); err != nil {
-		log.Error(err)
+		Msg   string `json:"msg"`
+		State int    `json:"state"`
 	}
 
+	err = jsoniter.Unmarshal(post, &infoNum)
+	if err != nil {
+		fmt.Println("解析失败")
+		log.Error(err)
+
+		return
+	}
 	if infoNum.Msg == "签名验证失败" || infoNum.Msg == "token验证失败" {
 		app.Conf = app.LoadConfig()
 
 		return
 	}
+	//if infoNum.Msg != "" {
+	//	fmt.Println("获取ios任务失败,错误为:", infoNum.Msg)
+	//	return
+	//}
+
 	var info model.CePingUserTask
 	info.PkgName = infoNum.Data.AppInfo.PkgName
 	info.FinishedTime = &times
@@ -285,31 +484,69 @@ func IosSearchOneDetail(c *gin.Context) {
 		return
 	}
 
-	var responses struct {
-		utils.ResponseJson
-		AppMd5     string   `json:"app_md5"`
-		AppName    string   `json:"app_name"`
-		AppPname   string   `json:"app_pname"`
-		AppSize    int      `json:"app_size"`
-		AppVersion string   `json:"app_version"`
-		DownUrl    string   `json:"down_url"`
-		Id         int      `json:"id"`
-		ItemKeys   []string `json:"item_keys"`
-		ItemKnum   int      `json:"item_knum"`
-		ItemNum    int      `json:"item_num"`
-		ResCode    int      `json:"res_code"`
-		Status     string   `json:"status"`
-		TCommit    string   `json:"t_commit"`
-		TUpdate    string   `json:"t_update"`
-		UserId     int      `json:"user_id"`
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = req.TaskId
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
 	}
-	iosClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	iosClient.Token = app.Conf.CePing.Token
-	iosClient.Signature = app.Conf.CePing.Signature
-	if err := iosClient.IosSearchOneDetailClient(&responses, req.TaskId); err != nil {
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+
+	clientURL := IP + "/v4/ios/search_one_detail"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	//Do方法发送请求
+	resp, err := client.Do(request)
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+
+	reponse := make(map[string]interface{})
+	err = jsoniter.Unmarshal(post, &reponse)
+	if err != nil {
 		log.Error(err)
+
+		return
 	}
-	response.OkWithData(responses, c)
+	err = Check(reponse, post, IosSearchOneDetail, c)
+	if err != nil {
+		log.Error(err.Error())
+		return
+	}
+
+	response.OkWithData(reponse, c)
 }
 
 type IosBatchStatisticsResultRequest struct {

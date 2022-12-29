@@ -123,69 +123,10 @@ func (c *EvaluationClient) SdkSearchOneDetail(handler ApiResponseHandler, taskId
 	})
 }
 
-// 获取任务进度接口  Android ios sdk 共享此接口
+// 获取任务进度接口
 func (c *EvaluationClient) TaskProgress(handler ApiResponseHandler, taskType string, taskId int) error {
 	return c.RequestApi("/task/progress", handler, map[string]interface{}{
 		"type":   taskType,
-		"taskid": taskId,
-	})
-}
-
-// BinCheckApk 2.1 上传apk并发送检测接口  android
-func (c *EvaluationClient) BinCheckApkClient(handler ApiResponseHandler, items, callbackUrl string, fileParam map[string]string) error {
-	return c.RequestApi("/bin_check_apk", handler, map[string]interface{}{
-		"items":        items,
-		"callback_url": callbackUrl,
-	}, fileParam)
-}
-
-// 获取android测评的高中低风险数
-func (c *EvaluationClient) GetAdInfoClient(handler ApiResponseHandler, taskId int) error {
-	return c.RequestApi("/ad/preview", handler, map[string]interface{}{
-		"taskid": taskId,
-	})
-}
-
-// SearchOneDetail 2.5查询某个测评apk的结果接口
-func (c *EvaluationClient) SearchOneDetailClient(handler ApiResponseHandler, taskId int) error {
-	return c.RequestApi("/search_one_detail", handler, map[string]interface{}{
-		"taskid": taskId,
-	})
-}
-
-// IosBinCheck 2.1 上传ios并发送检测接口  ios
-func (c *EvaluationClient) IosBinCheckClient(handler ApiResponseHandler, items, callbackUrl string, fileParam map[string]string) error {
-	return c.RequestApi("/ios/bin_check_apk", handler, map[string]interface{}{
-		"items":        items,
-		"callback_url": callbackUrl,
-	}, fileParam)
-}
-
-// 获取ipa测评的高中低风险数
-func (c *EvaluationClient) GetIpaInfoClient(handler ApiResponseHandler, taskId int) error {
-	return c.RequestApi("/ios/preview", handler, map[string]interface{}{
-		"taskid": taskId,
-	})
-}
-
-// IosSearchOneDetail 3.2.查询ipa检测任务的结果接口
-func (c *EvaluationClient) IosSearchOneDetailClient(handler ApiResponseHandler, taskId int) error {
-	return c.RequestApi("/ios/search_one_detail", handler, map[string]interface{}{
-		"taskid": taskId,
-	})
-}
-
-// SdkBinCheck 14.1.上传sdk并发送检测接口
-func (c *EvaluationClient) SdkBinCheckClient(handler ApiResponseHandler, items, callbackUrl string, fileParam map[string]string) error {
-	return c.RequestApi("/sdk/bin_check_apk", handler, map[string]interface{}{
-		"items":        items,
-		"callback_url": callbackUrl,
-	}, fileParam)
-}
-
-// SdkSearchOneDetail 14.2.查询sdk检测任务的结果接口
-func (c *EvaluationClient) SdkSearchOneDetailClient(handler ApiResponseHandler, taskId int) error {
-	return c.RequestApi("/sdk/search_one_detail", handler, map[string]interface{}{
 		"taskid": taskId,
 	})
 }

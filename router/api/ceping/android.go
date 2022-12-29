@@ -7,7 +7,6 @@ import (
 	"example.com/m/model"
 	"example.com/m/pkg/app"
 	"example.com/m/pkg/log"
-	"example.com/m/utils"
 	"example.com/m/utils/response"
 	"fmt"
 	"github.com/gin-gonic/gin"
@@ -17,6 +16,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,7 +77,7 @@ func (h *Handler) Check(han *Handler) {
 	}
 	for _, taskId := range h.GetTaskIds() {
 		fmt.Println("检查任务状态", taskId)
-		CheckAdInfo(taskId, han)
+		CheckState(taskId, han)
 	}
 }
 
@@ -90,6 +90,159 @@ func (h *Handler) RemoveTask(taskId int) {
 			break
 		}
 	}
+}
+
+func CheckState(taskId int, han *Handler) {
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = taskId
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		return
+	}
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		log.Error("err:", err.Error())
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		log.Error("err:", err.Error())
+		return
+	}
+
+	clientURL := IP + "/v4/search_one_detail"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		log.Error("err:", err.Error())
+		return
+	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := client.Do(request)
+	if err != nil {
+		log.Error("err:", err.Error())
+		return
+	}
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Error("err:", err.Error())
+		return
+	}
+
+	reponse := make(map[string]interface{})
+	err = jsoniter.Unmarshal(post, &reponse)
+	if err != nil {
+		log.Error("err:", err.Error())
+		return
+	}
+
+	errMessage := ""
+	if len(reponse) == 0 {
+		errMessage = strings.Trim(string(post), `"`)
+	} else if key, ok := reponse["state"].(float64); ok && key != 200 {
+		errMessage = reponse["msg"].(string)
+	}
+	fmt.Println("err", errMessage)
+	if errMessage == "签名验证失败" || errMessage == "token验证失败" {
+		// 1.尝试是否可以获取到token
+		_, _, err := app.GetCpToken(app.Conf.CePing.UserName, app.Conf.CePing.Password, app.Conf.CePing.Ip)
+		if err != nil {
+			log.Error("err:", err.Error())
+			return
+		}
+		// 2.获取到token便重新调用该方法
+		app.Conf = app.LoadConfig()
+		CheckState(taskId, han)
+		return
+	}
+	if errMessage != "" {
+		log.Error("app.conf", app.Conf.CePing.Signature)
+		log.Error("err", errMessage)
+		return
+	}
+
+	knum, _ := reponse["item_knum"].(float64)
+	num, _ := reponse["item_num"].(float64)
+	score, _ := reponse["app_score"].(float64)
+
+	fmt.Println("预览地址", reponse["view_url"])
+	viewUrl, _ := reponse["view_url"].(string)
+
+	var TaskInfo model.CePingUserTask
+
+	TaskInfo.Score = int(score)
+	TaskInfo.ViewUrl = viewUrl
+	TaskInfo.FinishItem = int(num)
+	if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).Updates(&TaskInfo).Error; err != nil {
+		if err != nil {
+			log.Error("err:", err.Error())
+			return
+		}
+	}
+
+	var FindInfo model.CePingUserTask
+	if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).First(&FindInfo).Error; err != nil {
+		if err != nil {
+			log.Error("err:", err.Error())
+			return
+		}
+	}
+	//fmt.Println("该任务的创建时间为",FindInfo.CreatedAt)
+	if FindInfo.CreatedAt.Add(1*time.Hour).Unix() < time.Now().Unix() {
+		han.RemoveTask(taskId)
+		FindInfo.Status = "测评失败"
+		FindInfo.Score = int(score)
+		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).Updates(&FindInfo).Error; err != nil {
+			log.Error("修改任务状态失败")
+			log.Error(err.Error())
+			return
+		}
+		return
+	}
+
+	fmt.Println("score", score)
+
+	if knum-num == 1 {
+		var taskInfo model.CePingUserTask
+		taskInfo.Status = "测评报告生成中"
+		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).
+			Updates(&taskInfo).Error; err != nil {
+			log.Error(err.Error())
+			return
+		}
+	}
+
+	var taskInfo model.CePingUserTask
+	taskInfo.Score = int(score)
+	taskInfo.Status = "测评完成"
+	//如果已完成测评项
+	if knum == num {
+		//才会写所有的数据
+		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).
+			Updates(&taskInfo).Error; err != nil {
+			log.Error(err.Error())
+			return
+		}
+		var GetTask model.CePingUserTask
+		GetTask.TaskID = strconv.Itoa(taskId)
+		GetTaskInfo(GetTask)
+
+		//fmt.Println("处理完成的任务ID", taskId)
+		//AndroidHandler.RemoveTask(taskId)
+		han.RemoveTask(taskId)
+		//fmt.Println("还剩下的任务ID", han.TaskIds)
+	}
+
 }
 
 type BinCheckApkRequest struct {
@@ -107,6 +260,13 @@ func BinCheckApk(c *gin.Context) {
 		response.FailWithMessage(err.Error(), c)
 		return
 	}
+
+	file, err := os.Open(request.FilePath)
+	if err != nil {
+		log.Error("err:", err.Error())
+		response.FailWithMessage("打开文件失败", c)
+		return
+	}
 	var templateInfo model.Template
 	if request.TemplateId == 0 {
 		templateInfo.Items = GetAllItems("ad")
@@ -119,22 +279,106 @@ func BinCheckApk(c *gin.Context) {
 		}
 	}
 
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	part, err := writer.CreateFormFile("apk", path.Base(file.Name()))
+	if err != nil {
+		log.Error("err:", err.Error())
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	_, err = io.Copy(part, file)
+	if err != nil {
+		log.Error("err:", err.Error())
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["items"] = templateInfo.Items
+	paramMap["callback_url"] = request.CallbackUrl
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		log.Error("err:", err.Error())
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		log.Error("err:", err.Error())
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		log.Error("err:", err.Error())
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	clientURL := IP + "/v4/bin_check_apk"
+	// 发送一个POST请求
+	req, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		log.Error("err:", err.Error())
+		response.FailWithMessage("构建请求失败", c)
+		return
+	}
+	// 设置你需要的Header（不要想当然的手动设置Content-Type）multipart/form-data
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// 执行请求
+	resp, err := Client.Do(req)
+	if err != nil {
+		log.Error("执行请求err:", err.Error())
+		response.FailWithMessage("调用测评对外接口失败,err:"+err.Error(), c)
+		return
+	}
+
+	// 3.读取返回内容
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Error("读取返回内容err:", err.Error())
+		response.FailWithMessage("读取测评对外接口内容失败,err:"+err.Error(), c)
+		return
+	}
 	// 1.解析内容
 	var adResponse struct {
-		utils.ResponseJson
+		Msg      string `json:"msg"`
+		State    int    `json:"state"`
 		SecInfos string `json:"sec_infos"`
 		ItemKnum int    `json:"item_knum"`
 		TaskId   int    `json:"task_id"`
 	}
-	adClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	adClient.Token = app.Conf.CePing.Token
-	adClient.Signature = app.Conf.CePing.Signature
-	err := adClient.BinCheckApkClient(&adResponse, templateInfo.Items, request.CallbackUrl, map[string]string{
-		"apk": request.FilePath,
-	})
+	err = jsoniter.Unmarshal(post, &adResponse)
 	if err != nil {
 		log.Error("调用测评平台接口解析内容失败", err)
 		response.FailWithMessage("调用测评平台接口解析内容失败,err:"+err.Error(), c)
+		return
+	}
+
+	if adResponse.State != 200 {
+		if adResponse.Msg == "签名验证失败" || adResponse.Msg == "token验证失败" {
+			// 1.尝试是否可以获取到token
+			_, _, err := app.GetCpToken(app.Conf.CePing.UserName, app.Conf.CePing.Password, app.Conf.CePing.Ip)
+			if err != nil {
+				// 如果获取不到就返回错误
+				response.FailWithMessage("token获取失败，请检查配置", c)
+				return
+			}
+			fmt.Println("------")
+			// 2.获取到token便重新调用该方法
+			app.Conf = app.LoadConfig()
+			BinCheckApk(c)
+			return
+		}
+		// 如果不是token的原因便返回原有的错误
+		log.Error("调用测评平台上传apk接口失败信息", string(post))
+		response.FailWithMessage("调用测评平台上传apk接口失败信息", c)
 		return
 	}
 
@@ -181,122 +425,208 @@ func BinCheckApk(c *gin.Context) {
 
 }
 
-// CheckTask 检查正在测评的apk进度
-func CheckAdInfo(taskId int, hand *Handler) {
-	var responses struct {
-		utils.ResponseJson
-		FinishItem int    `json:"finish_item"`
-		QueueNumer int    `json:"queue_numer"`
-		Status     string `json:"status"`
-		TotalItem  int    `json:"total_item"`
-	}
-	adClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	adClient.Token = app.Conf.CePing.Token
-	adClient.Signature = app.Conf.CePing.Signature
-	if err := adClient.TaskProgress(&responses, "Android", taskId); err != nil {
-		log.Error(err)
+// GetTaskInfo 获取任务详细信息
+func GetTaskInfo(task model.CePingUserTask) {
+
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = task.TaskID
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		return
 	}
 
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		return
+	}
+
+	err = writer.Close()
+	if err != nil {
+		return
+	}
+
+	clientURL := IP + "/v4/batch_statistics_result"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		return
+	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	//Do方法发送请求
+	resp, err := client.Do(request)
+	if err != nil {
+		return
+	}
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	reponse := make(map[string]interface{})
+	err = jsoniter.Unmarshal(post, &reponse)
+	if err != nil {
+		return
+	}
 	errMessage := ""
-	if responses.State != 200 {
-		errMessage = responses.Msg
+	if len(reponse) == 0 {
+		errMessage = strings.Trim(string(post), `"`)
+	} else if key, ok := reponse["state"].(float64); ok && key != 200 {
+		errMessage = reponse["msg"].(string)
 	}
 	fmt.Println("err", errMessage)
 	if errMessage == "签名验证失败" || errMessage == "token验证失败" {
-		// 1.尝试是否可以获取到token
-		_, _, err := app.GetCpToken(app.Conf.CePing.UserName, app.Conf.CePing.Password, app.Conf.CePing.Ip)
-		if err != nil {
-			log.Error("err:", err.Error())
-			return
-		}
-		// 2.获取到token便重新调用该方法
 		app.Conf = app.LoadConfig()
-		CheckAdInfo(taskId, hand)
-		return
-	}
-	if errMessage != "" {
 		log.Error("err", errMessage)
 		return
 	}
-
-	var taskInfo model.CePingUserTask
-	taskInfo.Status = "测评中"
-	taskInfo.ItemsNum = responses.TotalItem
-	taskInfo.FinishItem = responses.FinishItem
-
-	switch responses.Status {
-	case "EXCEPTION":
-		hand.RemoveTask(taskId)
-		taskInfo.Status = "测评失败"
-		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).Updates(&taskInfo).Error; err != nil {
-			log.Error(err)
-		}
-		return
-	case "REPORT_GENERATING":
-		taskInfo.Status = "测评报告生成中"
-		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).
-			Updates(&taskInfo).Error; err != nil {
-			fmt.Println("修改失败", err)
-			log.Error(err)
-			return
-		}
-	case "FINISHED":
-		taskInfo.Status = "测评完成"
-		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).
-			Updates(&taskInfo).Error; err != nil {
-			log.Error(err.Error())
-			return
-		}
-		// 如果检测完毕 就获取检测信息
-		GetAdInfo(taskId)
-		hand.RemoveTask(taskId)
-	default:
-		if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).
-			Updates(&taskInfo).Error; err != nil {
-			log.Error(err.Error())
-			return
-		}
+	if errMessage != "" {
+		log.Error("app.conf", app.Conf.CePing.Signature)
+		log.Error("err", errMessage)
 	}
+
+	info := make(map[string]interface{})
+	infostring, _ := jsoniter.Marshal(reponse["vulnerability_statistic"])
+	err = jsoniter.Unmarshal(infostring, &info)
+	if err != nil {
+		return
+	}
+	//fmt.Println("info", info)
+	//fmt.Println("HIGH111", info["middle"])
+
+	//fmt.Println("已完成测评开始获取任务详细信息")
+
+	hignNum := info["high"].(float64)
+	middleNum := info["middle"].(float64)
+	lowNum := info["low"].(float64)
+
+	fmt.Println("middle", middleNum)
+	//fmt.Println("----", reflect.TypeOf(info["middle"]))
+
+	task.Status = "测评完成"
+	task.HighNum = int(hignNum)
+	task.MiddleNum = int(middleNum)
+	task.LowNum = int(lowNum)
+	task.RiskNum = task.HighNum + task.LowNum + task.MiddleNum
+	times := time.Now()
+	task.FinishedTime = &times
+
+	if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id", task.TaskID).Updates(&task).Error; err != nil {
+		log.Error(err)
+		return
+	}
+
+	return
 }
 
-// GetAdInfo 获取ad检测信息
-func GetAdInfo(taskId int) {
-	times := time.Now()
-	var infoNum struct {
-		utils.ResponseJson
-		Data struct {
-			RiskStatistic struct {
-				Low    int `json:"low"`
-				Medium int `json:"medium"`
-				High   int `json:"high"`
-			} `json:"risk_statistic"`
-		} `json:"data"`
-	}
+// CheckTask 检查正在测评的apk进度
+func CheckTask(taskId int, modelInfo model.CePingUserTask) {
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = taskId
 
-	adClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	adClient.Token = app.Conf.CePing.Token
-	adClient.Signature = app.Conf.CePing.Signature
-	if err := adClient.GetAdInfoClient(&infoNum, taskId); err != nil {
-		log.Error(err)
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		return
 	}
-
-	if infoNum.Msg == "签名验证失败" || infoNum.Msg == "token验证失败" {
-		app.Conf = app.LoadConfig()
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		return
+	}
+	err = writer.Close()
+	if err != nil {
 
 		return
 	}
 
-	var info model.CePingUserTask
-	info.FinishedTime = &times
-	info.LowNum = infoNum.Data.RiskStatistic.Low
-	info.MiddleNum = infoNum.Data.RiskStatistic.Medium
-	info.HighNum = infoNum.Data.RiskStatistic.High
-	info.RiskNum = infoNum.Data.RiskStatistic.Low + infoNum.Data.RiskStatistic.Medium + infoNum.Data.RiskStatistic.High
-	info.Status = "测评完成"
-	if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", taskId).Updates(&info).Error; err != nil {
-		log.Error(err)
-		fmt.Println(err)
+	clientURL := IP + "/v4/search_one_detail"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		return
 	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	for {
+		time.Sleep(10 * time.Second)
+		resp, err := client.Do(request)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+		post, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+
+		reponse := make(map[string]interface{})
+		err = jsoniter.Unmarshal(post, &reponse)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+
+		errMessage := ""
+		if len(reponse) == 0 {
+			errMessage = strings.Trim(string(post), `"`)
+		} else if key, ok := reponse["state"].(float64); ok && key != 200 {
+			errMessage = reponse["msg"].(string)
+		}
+		fmt.Println("err", errMessage)
+		if errMessage == "签名验证失败" || errMessage == "token验证失败" {
+			app.Conf = app.LoadConfig()
+
+			break
+		}
+		if errMessage != "" {
+			fmt.Println("app.conf", app.Conf.CePing.Signature)
+			log.Error("err", errMessage)
+		}
+
+		knum, _ := reponse["item_knum"].(float64)
+		num, _ := reponse["item_num"].(float64)
+		score, _ := reponse["app_score"].(float64)
+		resCode, _ := reponse["res_code"].(float64)
+
+		var TaskInfo model.CePingUserTask
+		TaskInfo.Status = "测评失败"
+		TaskInfo.Score = int(score)
+		fmt.Println("resCode", resCode)
+
+		//fmt.Println("score", score)
+
+		var taskInfo model.CePingUserTask
+		taskInfo.Score = int(score)
+		taskInfo.Status = "测评完成"
+		//如果已完成测评项
+		if knum == num {
+			//才会写所有的数据
+			if err := app.DB.Model(&model.CePingUserTask{}).Where("task_id = ?", modelInfo.TaskID).
+				Updates(&taskInfo).Error; err != nil {
+				log.Error("修改失败", err)
+				return
+			}
+			GetTaskInfo(modelInfo)
+			break
+		}
+	}
+
 }
 
 func checkError(post []byte) (rep map[string]interface{}, err error) {
@@ -322,6 +652,79 @@ type SearchOneRequest struct {
 	TaskId int `form:"task_id" binding:"required"`
 }
 
+// SearchOneProgress 2.4查询某个正在测评的apk进度接口
+func SearchOneProgress(c *gin.Context) {
+	req := SearchOneRequest{}
+
+	valid, errs := app.BindAndValid(c, &req)
+	if !valid {
+		response.FailWithMessage(errs.Error(), c)
+		return
+	}
+
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = req.TaskId
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	clientURL := IP + "/v4/search_one_progress"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	//Do方法发送请求
+	resp, err := client.Do(request)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	reponse := make(map[string]interface{})
+	err = jsoniter.Unmarshal(post, &reponse)
+	if err != nil {
+		return
+	}
+	//err = Check(reponse, post, BinCheckApk, c)
+	//if err != nil {
+	//	log.Error(err.Error())
+	//
+	//	return
+	//}
+
+	response.OkWithData(reponse, c)
+}
+
 type SearchOneDetailRequest struct {
 	TaskId int `form:"task_id" binding:"required"`
 }
@@ -335,43 +738,68 @@ func SearchOneDetail(c *gin.Context) {
 		return
 	}
 
-	var responses struct {
-		utils.ResponseJson
-		Status      string      `json:"status"`
-		ResTxt      string      `json:"res_txt"`
-		ItemKeys    string      `json:"item_keys"`
-		ViewUrl     string      `json:"view_url"`
-		AppPname    string      `json:"app_pname"`
-		ItemNum     int         `json:"item_num"`
-		DownUrl     string      `json:"down_url"`
-		Id          int         `json:"id"`
-		AppName     string      `json:"app_name"`
-		UserId      int         `json:"user_id"`
-		AppFilename string      `json:"app_filename"`
-		CusBuilt    interface{} `json:"cus_built"`
-		IsSample    int         `json:"isSample"`
-		AppVersion  string      `json:"app_version"`
-		ApkShield   string      `json:"apk_shield"`
-		ApkMd5      string      `json:"apk_md5"`
-		IsTarget    int         `json:"is_target"`
-		PdfReport   string      `json:"pdf_report"`
-		ItemKnum    int         `json:"item_knum"`
-		TUpdate     string      `json:"t_update"`
-		ResCode     int         `json:"res_code"`
-		TCommit     string      `json:"t_commit"`
-		SecInfos    string      `json:"sec_infos"`
-		TaskId      int         `json:"task_id"`
-		ApkUuid     string      `json:"apk_uuid"`
-		Callback    string      `json:"callback"`
-		AppSize     string      `json:"app_size"`
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = req.TaskId
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
 	}
-	adClient := utils.NewClient(app.Conf.CePing.Ip, app.Conf.CePing.UserName, app.Conf.CePing.Password)
-	adClient.Token = app.Conf.CePing.Token
-	adClient.Signature = app.Conf.CePing.Signature
-	if err := adClient.SearchOneDetailClient(&responses, req.TaskId); err != nil {
-		log.Error(err)
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
 	}
-	response.OkWithData(responses, c)
+	err = writer.Close()
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	clientURL := IP + "/v4/search_one_detail"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	//Do方法发送请求
+	resp, err := client.Do(request)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	fmt.Println(string(post))
+	reponse := make(map[string]interface{})
+	err = jsoniter.Unmarshal(post, &reponse)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	err = Check(reponse, post, SearchOneDetail, c)
+	if err != nil {
+		log.Error(err.Error(), c)
+		return
+	}
+	response.OkWithData(reponse, c)
 
 }
 
@@ -625,6 +1053,126 @@ func BatchDownload(c *gin.Context) {
 
 }
 
+type BatchStatisticsRequest struct {
+	TaskID string `form:"taskid" binding:"required"`
+}
+
+// BatchStatisticsResult 2.7.查询测评apk统计及源结果接口
+func BatchStatisticsResult(c *gin.Context) {
+	var req = BatchStatisticsRequest{}
+	if err := c.Bind(&req); err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	buff := &bytes.Buffer{}
+	writer := multipart.NewWriter(buff)
+	paramMap := make(map[string]interface{})
+	paramMap["token"] = app.Conf.CePing.Token
+	paramMap["signature"] = app.Conf.CePing.Signature
+	paramMap["taskid"] = req.TaskID
+
+	value, err := jsoniter.Marshal(paramMap)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	err = writer.WriteField("param", string(value))
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	clientURL := IP + "/v4/batch_statistics_result"
+
+	//生成post请求
+	client := &http.Client{}
+	request, err := http.NewRequest("POST", clientURL, buff)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	//注意别忘了设置header
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	//Do方法发送请求
+	resp, err := client.Do(request)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	post, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+
+	reponse := make(map[string]interface{})
+	err = jsoniter.Unmarshal(post, &reponse)
+	if err != nil {
+		return
+	}
+	errMessage := ""
+	if len(reponse) == 0 {
+		errMessage = strings.Trim(string(post), `"`)
+	} else if key, ok := reponse["state"].(float64); ok && key != 200 {
+		errMessage = reponse["msg"].(string)
+	}
+	fmt.Println("err", errMessage)
+	if errMessage == "签名验证失败" || errMessage == "token验证失败" {
+		// 1.尝试是否可以获取到token
+		_, _, err := app.GetCpToken(app.Conf.CePing.UserName, app.Conf.CePing.Password, app.Conf.CePing.Ip)
+		if err != nil {
+			// 如果获取不到就返回错误
+			response.FailWithMessage("token获取失败，请检查配置", c)
+			return
+		}
+		// 2.获取到token便重新调用该方法
+		app.Conf = app.LoadConfig()
+		BatchStatisticsResult(c)
+		return
+	}
+	if errMessage != "" {
+		fmt.Println("app.conf", app.Conf.CePing.Signature)
+		log.Error(err.Error())
+		response.FailWithMessage("调用测评平台接口失败"+err.Error(), c)
+		return
+	}
+
+	marshal, err := jsoniter.Marshal(reponse["vulnerability_statistic"])
+	if err != nil {
+		return
+	}
+	var miNum map[string]interface{}
+	err = jsoniter.Unmarshal(marshal, &miNum)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("333", miNum["middle"])
+	midel, ok := miNum["middle"].(float64)
+	if !ok {
+		fmt.Println("不成功")
+	}
+	fmt.Println("成功", midel)
+
+	response.OkWithData(reponse, c)
+
+}
+
+type BatchStatisticsOriginalRequest struct {
+	TaskID string `form:"taskid" binding:"required"`
+}
+
+type GetItemsRequest struct {
+	UserId int `form:"userid"`
+}
 type BatchFileDeleteRequest struct {
 	TaskIds string `form:"task_id" binding:"required"`
 }
