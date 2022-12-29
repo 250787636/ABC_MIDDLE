@@ -1,0 +1,19 @@
+[
+  "sdk_soProtect",
+  "sdk_decompile",
+  "sdk_code_proguard",
+  "sdk_res_protect",
+  "sdk_only_use_java_code",
+  "sdk_shield",
+  "sdk_sign_cert",
+  "sdk_testprop",
+  "sdk_permission",
+  "sdk_behavior",
+  "sdk_tpSdk",
+  "sdk_words",
+  "sdk_scan_virus",
+  "sdk_res_apk",
+  "sdk_custom_perms",
+  "sdk_excessive_perm_announce",
+  "sdk_user_privacy_info"
+]

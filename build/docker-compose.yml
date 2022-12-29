@@ -1,0 +1,36 @@
+#巴拉巴拉
+version: '3.7'
+services:
+  #backend
+  tp-abc-backend:
+    image: harbor.bangcle.net:8029/custom_development/tp-abc-backend:${TP_ABC_BACKEND}
+    container_name: tp-abc-backend
+    hostname: tp-abc-backend
+    privileged: true
+    restart: always
+    ports:
+      - "9100:9100"
+    volumes:
+      - ${ENVIRONMENT_ROOT}/tp-abc-backend/media:/data/media
+      - ${ENVIRONMENT_ROOT}/tp-abc-backend/logs:/data/logs
+      - ${ENVIRONMENT_ROOT}/tp-abc-backend/deploy.ini:/data/deploy.ini
+    networks:
+      - tpnet
+  #front
+  tp-abc-front:
+    image: harbor.bangcle.net:8029/custom_development/tp-abc-front:${TP_ABC_FRONT}
+    container_name: tp-abc-front
+    hostname: tp-abc-front
+    privileged: true
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ${ENVIRONMENT_ROOT}/tp-abc-front/conf/:/etc/nginx/
+      - ${ENVIRONMENT_ROOT}/tp-abc-front/log:/var/log/nginx
+    networks:
+      - tpnet
+networks:
+  tpnet:
+    name: tp_network
+    driver: bridge

@@ -1,0 +1,8 @@
+media/
+customer.ini
+.idea
+a.json
+logs
+dockerwork
+vendor/
+logs/
